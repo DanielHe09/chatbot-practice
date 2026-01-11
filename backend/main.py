@@ -5,7 +5,7 @@ from typing import List, Optional
 import uvicorn
 import os
 from dotenv import load_dotenv
-from langchain.agents import create_agent
+from langchain_anthropic import ChatAnthropic
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -19,13 +19,44 @@ app = FastAPI(title="Chatbot RAG API")
 
 # Initialize Supabase connection
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Use service role key for admin access
-SUPABASE_TABLE_NAME = os.getenv("SUPABASE_TABLE_NAME", "documents")  # Default table name
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # Must be the SERVICE ROLE KEY (secret), not the anon/public key
+SUPABASE_TABLE_NAME = os.getenv("SUPABASE_TABLE_NAME", "embeddings")  # Default to "embeddings" (your actual table name)
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env file")
+    raise ValueError(
+        "SUPABASE_URL and SUPABASE_KEY must be set in .env file. "
+        "SUPABASE_KEY must be the SERVICE ROLE KEY (secret key) from Supabase dashboard, "
+        "not the anon/public key. Find it in Settings → API → service_role key."
+    )
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Validate URL format - should be https://xxxxx.supabase.co, not a postgresql:// connection string
+if not SUPABASE_URL.startswith("https://"):
+    raise ValueError(
+        f"SUPABASE_URL must be the Supabase project URL (e.g., https://xxxxx.supabase.co), "
+        f"not a PostgreSQL connection string. Current value: {SUPABASE_URL[:50]}..."
+    )
+
+# Validate key format
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY is empty")
+if len(SUPABASE_KEY) < 20:
+    raise ValueError(f"SUPABASE_KEY seems too short ({len(SUPABASE_KEY)} chars). Make sure you copied the full key.")
+if SUPABASE_KEY.startswith("anon.") or SUPABASE_KEY.startswith("eyJ") and "anon" in SUPABASE_KEY:
+    raise ValueError(
+        "SUPABASE_KEY appears to be the anon/public key. You need the SERVICE ROLE KEY (secret key). "
+        "Find it in Supabase Dashboard → Settings → API → service_role key"
+    )
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    if "Invalid API key" in str(e) or "Invalid" in str(e):
+        raise ValueError(
+            f"Invalid Supabase API key. Make sure you're using the SERVICE ROLE KEY (secret key), "
+            f"not the anon/public key. Key starts with: {SUPABASE_KEY[:15]}... "
+            f"Error: {str(e)}"
+        ) from e
+    raise
 
 # Initialize embeddings
 from langchain_openai import OpenAIEmbeddings
@@ -35,6 +66,11 @@ if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY must be set in .env file for embeddings")
 
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY, model="text-embedding-3-small")
+
+# Initialize Anthropic API key
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    raise ValueError("ANTHROPIC_API_KEY must be set in .env file")
 
 # Initialize text splitter
 text_splitter = RecursiveCharacterTextSplitter(
@@ -57,15 +93,112 @@ def get_vector_store():
         )
     return vector_store
 
-agent = create_agent(
-    model="claude-sonnet-4-5-20250929",
-    tools=[],
-    system_prompt="You are a helpful assistant that can retreive context from a vector store to answer use questions",
-)
+def add_documents_with_int_ids(documents):
+    """
+    Add documents to Supabase with integer IDs instead of UUIDs.
+    This works around the limitation where the id column must be an integer.
+    Uses BIGSERIAL auto-increment, so we don't specify the id - PostgreSQL will assign it.
+    """
+    # Generate embeddings for all documents
+    texts = [doc.page_content for doc in documents]
+    doc_embeddings = embeddings.embed_documents(texts)
+    
+    # Prepare records (without id - let PostgreSQL auto-increment)
+    records = []
+    for doc, embedding in zip(documents, doc_embeddings):
+        # Ensure metadata is a valid JSON object
+        doc_metadata = {}
+        if hasattr(doc, 'metadata') and doc.metadata:
+            # Convert metadata to a JSON-serializable format
+            doc_metadata = {k: str(v) for k, v in doc.metadata.items()}
+        
+        record = {
+            "content": doc.page_content,
+            "embedding": embedding,  # This should be a list of floats
+            "metadata": doc_metadata
+        }
+        records.append(record)
+    
+    # Insert in batches (PostgreSQL will auto-assign integer IDs)
+    batch_size = 100
+    total_inserted = 0
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        try:
+            result = supabase.table(SUPABASE_TABLE_NAME).insert(batch).execute()
+            total_inserted += len(batch)
+        except Exception as e:
+            # Provide more detailed error information
+            error_msg = str(e)
+            if hasattr(e, 'message'):
+                error_msg = e.message
+            raise Exception(
+                f"Failed to insert documents into Supabase. "
+                f"Error: {error_msg}. "
+                f"Make sure your table has columns: id (BIGSERIAL), content (TEXT), "
+                f"metadata (JSONB), embedding (vector(1536)). "
+                f"Batch index: {i}, Records in batch: {len(batch)}"
+            ) from e
+    
+    return total_inserted
 
+# Initialize LLM - Switch between Anthropic and OpenAI
+USE_ANTHROPIC = os.getenv("USE_ANTHROPIC", "false").lower() == "true"
 
-def retrieve_context():
-    return "This is the context of the document"
+if USE_ANTHROPIC:
+    # Use Claude (requires ANTHROPIC_API_KEY)
+    from langchain_anthropic import ChatAnthropic
+    llm = ChatAnthropic(
+        model="claude-3-5-sonnet-20240620",
+        anthropic_api_key=ANTHROPIC_API_KEY,
+        temperature=0.7,
+    )
+else:
+    # Use OpenAI (cheaper, good for testing)
+    from langchain_openai import ChatOpenAI
+    MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # or "gpt-4" for better quality
+    llm = ChatOpenAI(
+        model=MODEL_NAME,
+        openai_api_key=OPENAI_API_KEY,
+        temperature=0.7,
+    )
+
+def retrieve_context(query: str, k: int = 4):
+    """
+    Retrieve relevant context from the vector store based on the user's query.
+    Uses the built-in SupabaseVectorStore retriever.
+    
+    Args:
+        query: The user's question/query
+        k: Number of relevant documents to retrieve (default: 4)
+    
+    Returns:
+        A string containing the retrieved context
+    """
+    try:
+        vector_store = get_vector_store()
+        retriever = vector_store.as_retriever(search_kwargs={"k": k})
+        documents = retriever.invoke(query)
+        
+        if not documents:
+            return "No relevant documents found in the knowledge base."
+        
+        context_parts = []
+        for i, doc in enumerate(documents, 1):
+            content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+            context_parts.append(f"[Document {i}]\n{content}")
+        
+        context = "\n\n".join(context_parts)
+        print(f"Retrieved {len(documents)} documents for query: {query[:50]}...")
+        return context
+        
+    except Exception as e:
+        # If retrieval fails, log the error and return helpful message
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error retrieving context: {e}")
+        print(f"Traceback: {error_details}")
+        return f"Unable to retrieve context from the knowledge base. Error: {str(e)}"
 
 # Enable CORS for Chrome extension
 app.add_middleware(
@@ -104,12 +237,44 @@ async def chat(request: ChatRequest):
         user_message = request.message
         conversation_history = request.conversation_history or []
 
-        # Run the agent
-        result = agent.invoke({"messages": [{"role": "user", "content": user_message}]})
+        # Step 1: Retrieve relevant context from vector store
+        context = retrieve_context(user_message, k=4)
         
-        # Extract response from agent result
-        # The exact structure depends on your agent implementation
-        response_text = result.get("output", str(result)) if isinstance(result, dict) else str(result)
+        # Step 2: Build the prompt with context
+        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+        
+        # System message that instructs the agent to use the retrieved context
+        system_prompt = """You are a helpful assistant that answers questions based on the provided context from a knowledge base.
+
+When answering:
+- Use the retrieved context to provide accurate, detailed answers
+- If the context contains relevant information, cite it in your response
+- If the context doesn't contain enough information to answer the question, say so
+- You can also use your general knowledge, but prioritize the provided context
+- Be concise but thorough"""
+        
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Add conversation history
+        for msg in conversation_history:
+            if msg.role == "user":
+                messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+        
+        # Add current user message with context
+        user_prompt = f"""Context from knowledge base:
+{context}
+
+User question: {user_message}
+
+Please answer the user's question using the context above when available."""
+        
+        messages.append(HumanMessage(content=user_prompt))
+        
+        # Step 3: Get response from LLM (the "agent")
+        response = llm.invoke(messages)
+        response_text = response.content if hasattr(response, 'content') else str(response)
         
         return ChatResponse(response=response_text)
     
@@ -159,14 +324,13 @@ async def ingest_documents(file: UploadFile = File(...)):
             # Split documents into chunks
             chunks = text_splitter.split_documents(documents)
             
-            # Get vector store and add documents
-            vector_store = get_vector_store()
-            vector_store.add_documents(chunks)
+            # Add documents with integer IDs (workaround for bigint id column)
+            chunks_created = add_documents_with_int_ids(chunks)
             
             return {
                 "message": "Documents ingested successfully",
                 "filename": file.filename,
-                "chunks_created": len(chunks),
+                "chunks_created": chunks_created,
                 "total_documents": len(documents)
             }
         
