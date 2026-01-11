@@ -1,32 +1,47 @@
-# Web Frontend
+# RAG Chatbot Frontend
 
-A simple standalone HTML page for the RAG Chatbot.
-
-## Usage
-
-1. Make sure your backend is running on `http://localhost:8000`
-
-2. Open `index.html` in your web browser:
-   - Double-click the file, or
-   - Right-click → Open With → Your Browser, or
-   - Drag and drop into your browser
-
-3. The page will:
-   - Allow you to upload PDF or TXT documents
-   - Chat with the RAG chatbot
-   - Display conversation history
+A modern React frontend for the RAG Chatbot application.
 
 ## Features
 
-- **Document Upload**: Upload PDF or text files to ingest into your vector store
-- **Chat Interface**: Simple, clean chat UI
+- **Document Upload**: Upload PDF or TXT files to ingest into the vector store
+- **Chat Interface**: Clean, modern chat UI for interacting with the AI agent
 - **Real-time Updates**: See messages as they're sent and received
-- **No Build Required**: Just open the HTML file - uses React from CDN
+- **Error Handling**: User-friendly error messages
 
-## API Connection
+## Setup
 
-The frontend connects to:
-- `http://localhost:8000/chat` - For chat messages
-- `http://localhost:8000/ingest` - For document uploads
+1. Install dependencies:
+```bash
+npm install
+```
 
-If your backend is hosted elsewhere, edit the `API_URL` constant in the HTML file.
+2. Start the development server:
+```bash
+npm run dev
+```
+
+The app will be available at `http://localhost:3000`
+
+## API Endpoints
+
+The frontend connects to the backend API at `http://localhost:8000`:
+
+- **POST /chat**: Send messages to the AI agent
+- **POST /ingest**: Upload documents for ingestion
+
+## Environment Variables
+
+Create a `.env` file in the `web` directory to customize the API URL:
+
+```
+VITE_API_URL=http://localhost:8000
+```
+
+## Build for Production
+
+```bash
+npm run build
+```
+
+The built files will be in the `dist` directory.
